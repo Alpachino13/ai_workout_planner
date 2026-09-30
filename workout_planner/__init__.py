@@ -1,0 +1,2 @@
+"""Standalone workout-planner agent."""
+
