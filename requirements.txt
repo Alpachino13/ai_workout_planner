@@ -866,3 +866,4 @@ zstandard==0.25.0
     # via
     #   langgraph-api
     #   langsmith
+langchain-groq
