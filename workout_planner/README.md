@@ -1,25 +1,23 @@
-# Standalone Workout Planner
+# Workout Planner (Streamlit + LangChain + Gemini)
 
-This is separate from the course notebooks. It is a small command-line agent
-powered by Gemini through `langchain-google-genai`.
-
-## Configure
-
-Put your Gemini key in the repository's existing `.env` file under:
-
-```env
-GOOGLE_API_KEY=your_key_here
+```bash
+uv run python -m workout_planner      # or: streamlit run workout_planner/app.py
 ```
 
-The agent does not create, modify, or print API keys.
+## Keys
+Locally: `.env` (see `.env.example`). On Streamlit Cloud: *App settings → Secrets*
+(see `.streamlit/secrets.toml.example`). `.env` is not deployed.
 
-## Run
+## LangSmith tracing
+Set `LANGSMITH_API_KEY`; tracing turns on automatically (`LANGSMITH_TRACING=false` forces it off).
+The sidebar **Monitoring** badge does a real authentication call and tells you what is wrong.
 
-From the repository root:
+| Symptom | Cause |
+|---|---|
+| "Tracing off" | no key in Secrets/.env, or placeholder value |
+| 401 | invalid/revoked key |
+| 403 | wrong region (EU is auto-detected) or org key without `LANGSMITH_WORKSPACE_ID` |
+| Traces in another project | `LANGSMITH_PROJECT` set elsewhere (default: `workout-planner`) |
 
-```powershell
-uv run python -m workout_planner
-```
-
-Type `exit` to stop.
-
+One user action = one trace (`workout_planner_turn` / `_approve` / `_decline` / `_feedback`),
+grouped per conversation by `thread_id`. Attached photos/audio are truncated in traces.

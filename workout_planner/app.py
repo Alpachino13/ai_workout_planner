@@ -3,11 +3,14 @@
 import asyncio
 import base64
 import html
+import logging
 import os
+import sys
+import threading
 import uuid
 import warnings
 from dataclasses import dataclass
-from itertools import islice
+from pathlib import Path
 from typing import Any, Dict
 
 import streamlit as st
@@ -23,49 +26,23 @@ load_dotenv()
 # ==============================================================================
 # ENVIRONMENT + LANGSMITH TRACING
 # ------------------------------------------------------------------------------
-# Why tracing was silent: on Streamlit Cloud your local .env is NOT deployed.
-# Keys live in  App settings -> Secrets.  We copy them into os.environ here,
-# normalise the old LANGCHAIN_* / new LANGSMITH_* names, and force tracing on
-# BEFORE any LangChain object is created.
+# All the env/secrets/region/payload handling lives in ls_tracing.py.
+# It MUST run before any LangChain object is created.
 # ==============================================================================
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ls_tracing  # noqa: E402
+
+logger = logging.getLogger("workout_planner")
 
 
-def bootstrap_env() -> None:
+def _load_secrets() -> dict:
     try:
-        for key, value in dict(st.secrets).items():
-            if isinstance(value, (str, int, float, bool)) and not os.environ.get(key):
-                os.environ[key] = str(value)
+        return st.secrets.to_dict()
     except Exception:
-        pass  # no secrets.toml locally — fine
-
-    # Strip stray quotes/whitespace that break auth silently.
-    for key in list(os.environ):
-        if key.startswith(("LANGSMITH_", "LANGCHAIN_")):
-            os.environ[key] = os.environ[key].strip().strip("'\"")
-
-    aliases = [
-        ("LANGSMITH_API_KEY", "LANGCHAIN_API_KEY"),
-        ("LANGSMITH_PROJECT", "LANGCHAIN_PROJECT"),
-        ("LANGSMITH_ENDPOINT", "LANGCHAIN_ENDPOINT"),
-    ]
-    for new, old in aliases:
-        if not os.environ.get(new) and os.environ.get(old):
-            os.environ[new] = os.environ[old]
-
-    if os.environ.get("LANGSMITH_API_KEY"):
-        os.environ.setdefault("LANGSMITH_TRACING", "true")
-    os.environ.setdefault("LANGSMITH_PROJECT", "workout-planner")
-
-    # Set both names so any installed langsmith/langchain version picks it up.
-    if os.environ.get("LANGSMITH_TRACING", "").lower() == "true":
-        os.environ["LANGCHAIN_TRACING_V2"] = "true"
-        os.environ["LANGCHAIN_API_KEY"] = os.environ.get("LANGSMITH_API_KEY", "")
-        os.environ["LANGCHAIN_PROJECT"] = os.environ["LANGSMITH_PROJECT"]
-        if os.environ.get("LANGSMITH_ENDPOINT"):
-            os.environ["LANGCHAIN_ENDPOINT"] = os.environ["LANGSMITH_ENDPOINT"]
+        return {}  # no secrets.toml locally — fine
 
 
-bootstrap_env()
+TRACING = ls_tracing.bootstrap(_load_secrets())
 
 from langchain.agents import AgentState, create_agent
 from langchain.agents.middleware import (
@@ -81,31 +58,19 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.runtime import Runtime
 from langgraph.types import Command
+from langsmith import traceable
 from tavily import TavilyClient
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def check_langsmith() -> tuple[str, str]:
-    """Returns (status, detail): ok | off | error."""
-    if os.environ.get("LANGSMITH_TRACING", "").lower() != "true":
-        return "off", "Add LANGSMITH_API_KEY to your app Secrets"
-    try:
-        from langsmith import Client
-
-        list(islice(Client().list_projects(limit=1), 1))  # real auth round-trip
-        return "ok", os.environ["LANGSMITH_PROJECT"]
-    except Exception as e:  # bad key, wrong region endpoint, network...
-        return "error", str(e)[:160]
+    """Returns (status, detail): ok | off | error — a real auth round-trip."""
+    return ls_tracing.verify()
 
 
 def flush_traces() -> None:
     """Make sure traces are uploaded before the script returns."""
-    try:
-        from langchain_core.tracers.langchain import wait_for_all_tracers
-
-        wait_for_all_tracers()
-    except Exception:
-        pass
+    ls_tracing.flush()
 
 
 # ==============================================================================
@@ -258,9 +223,17 @@ research_subagent = create_agent(
 
 
 @tool("research_assistant")
-def call_research_assistant(query: str) -> str:
+async def call_research_assistant(query: str) -> str:
     """Delegates research queries to a subagent to find fitness, exercise, or equipment information."""
-    result = research_subagent.invoke({"messages": [{"role": "user", "content": query}]})
+    # Async on purpose: the subagent's trace nests under this tool call through the
+    # running context. A sync tool is pushed to a thread executor, where that parent
+    # link depends on the Python version. Do NOT forward the parent's callbacks/config
+    # by hand: that registers a second tracer and floods the logs with
+    # "No indexed run ID" errors.
+    result = await research_subagent.ainvoke(
+        {"messages": [{"role": "user", "content": query}]},
+        {"run_name": "research_subagent", "tags": ["subagent"]},
+    )
     return extract_text(result["messages"][-1].content)
 
 
@@ -281,7 +254,7 @@ async def build_agent():
         client = MultiServerMCPClient(MCP_SERVERS)
         tools.extend(await client.get_tools())
     except Exception:
-        pass
+        logger.warning("Rhylthyme MCP tools unavailable; continuing without them", exc_info=logger.isEnabledFor(logging.DEBUG))
 
     return create_agent(
         model=model,
@@ -302,7 +275,7 @@ def make_config(thread_id: str) -> dict[str, Any]:
     return {
         "configurable": {"thread_id": thread_id},
         "metadata": {"thread_id": thread_id},  # groups turns into one LangSmith thread
-        "run_name": "workout_planner_turn",
+        "run_name": "workout_planner_agent",
         "tags": ["workout-planner", "gemini", "streamlit"],
     }
 
@@ -405,13 +378,20 @@ STARTERS = [
 # ==============================================================================
 
 
+@st.cache_resource(show_spinner=False)
+def _get_loop() -> asyncio.AbstractEventLoop:
+    """One long-lived event loop on a background thread, shared by every rerun.
+
+    Creating a fresh loop per call (and never closing it) breaks async HTTP clients
+    that stay bound to the loop they were first used on ("Event loop is closed").
+    """
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, name="agent-loop", daemon=True).start()
+    return loop
+
+
 def run_async(coro):
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    return loop.run_until_complete(coro)
+    return asyncio.run_coroutine_threadsafe(coro, _get_loop()).result()
 
 
 @st.cache_resource(show_spinner=False)
@@ -445,31 +425,98 @@ with st.spinner("Starting your coach..."):
 config = make_config(st.session_state.thread_id)
 
 
-def advance(ctx: Context):
-    """Keep running while pending tools are safe; stop when approval is needed or the turn ends."""
-    state = run_async(agent.aget_state(config))
+def _summarize_inputs(inputs: dict) -> dict:
+    """Compact, readable inputs for the parent trace (no base64, no objects)."""
+    payload, ctx = inputs.get("payload"), inputs.get("ctx")
+    blocks = payload if isinstance(payload, list) else []
+    return {
+        "kind": inputs.get("kind"),
+        "user_message": " ".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text") or None,
+        "attachment": next((b["type"] for b in blocks if isinstance(b, dict) and b.get("type") in MEDIA_TYPES), None),
+        "reason": inputs.get("reason"),
+        "units": getattr(ctx, "units", None),
+        "language": getattr(ctx, "language", None),
+    }
+
+
+@traceable(run_type="chain", name="workout_planner_turn", process_inputs=_summarize_inputs)
+async def traced_turn(
+    kind: str,
+    payload: Any,
+    ctx: Context,
+    thread_id: str,
+    tool_calls: list | None = None,
+    reason: str | None = None,
+) -> dict:
+    """One user action (message / approve / decline / feedback) = ONE LangSmith trace.
+
+    Because of `interrupt_before=["tools"]`, a single message used to produce three
+    unrelated root traces. Running the whole loop inside this parent run keeps the
+    model calls, tool calls and the research subagent in a single tree.
+    """
+    cfg = make_config(thread_id)
+    if kind == "message":
+        await agent.ainvoke({"messages": [{"role": "user", "content": payload}]}, cfg, context=ctx)
+    elif kind == "approve":
+        await agent.ainvoke(None, cfg, context=ctx)
+    else:  # decline / feedback: answer the pending tool calls, then let the model react
+        msgs = [ToolMessage(tool_call_id=tc["id"], name=tc["name"], content=reason) for tc in tool_calls or []]
+        await agent.aupdate_state(cfg, {"messages": msgs}, as_node="tools")
+        await agent.ainvoke(None, cfg, context=ctx)
+
+    # Keep running while pending tools are safe; stop when approval is needed or the turn ends.
+    state = await agent.aget_state(cfg)
     for _ in range(8):
         if not state.next:
             break
         calls = getattr(state.values["messages"][-1], "tool_calls", None) or []
         if calls and not all(c["name"] in SAFE_TOOLS for c in calls):
             break
-        run_async(agent.ainvoke(None, config, context=ctx))
-        state = run_async(agent.aget_state(config))
-    flush_traces()
+        await agent.ainvoke(None, cfg, context=ctx)
+        state = await agent.aget_state(cfg)
+
+    last = state.values["messages"][-1]
+    return {
+        "awaiting_approval": bool(state.next),
+        "pending_tools": [c["name"] for c in (getattr(last, "tool_calls", None) or [])] if state.next else [],
+        "reply": None if state.next else extract_text(last.content),
+    }
+
+
+def run_turn(
+    kind: str,
+    ctx: Context,
+    payload: Any = None,
+    tool_calls: list | None = None,
+    reason: str | None = None,
+) -> None:
+    """Run one traced turn, flush the trace, and update the Streamlit session state."""
+    thread_id = st.session_state.thread_id
+    try:
+        run_async(
+            traced_turn(
+                kind,
+                payload,
+                ctx,
+                thread_id,
+                tool_calls,
+                reason,
+                langsmith_extra={
+                    "name": "workout_planner_turn" if kind == "message" else f"workout_planner_{kind}",
+                    "metadata": {"thread_id": thread_id, "turn_kind": kind},  # groups turns into one LangSmith thread
+                    "tags": ["workout-planner", "gemini", "streamlit"],
+                },
+            )
+        )
+    finally:
+        flush_traces()  # also on errors: failed runs are the ones you want to see
+
+    state = run_async(agent.aget_state(make_config(thread_id)))
     st.session_state.hitl_snapshot = state
     if not state.next:
         st.session_state.messages.append(
             {"role": "assistant", "content": extract_text(state.values["messages"][-1].content)}
         )
-    return state
-
-
-def resolve_pending(ctx: Context, tool_calls, reason: str) -> None:
-    msgs = [ToolMessage(tool_call_id=tc["id"], name=tc["name"], content=reason) for tc in tool_calls]
-    run_async(agent.aupdate_state(config, {"messages": msgs}, as_node="tools"))
-    run_async(agent.ainvoke(None, config, context=ctx))
-    advance(ctx)
 
 
 # ==============================================================================
@@ -569,18 +616,17 @@ if awaiting_approval:
             c1, c2, c3 = st.columns(3)
             if c1.button("Approve", type="primary", use_container_width=True, icon=":material/check:"):
                 with st.spinner("Running..."):
-                    run_async(agent.ainvoke(None, config, context=ctx))
-                    advance(ctx)
+                    run_turn("approve", ctx)
                 st.rerun()
             if c2.button("Decline", use_container_width=True, icon=":material/close:"):
                 with st.spinner("Updating..."):
-                    resolve_pending(ctx, calls, "Action blocked: user declined.")
+                    run_turn("decline", ctx, tool_calls=calls, reason="Action blocked: user declined.")
                 st.rerun()
             with c3.popover("Suggest a change", use_container_width=True, icon=":material/edit:"):
                 feedback = st.text_input("What should change?", key="hitl_feedback")
                 if st.button("Send", key="hitl_send", disabled=not feedback):
                     with st.spinner("Updating..."):
-                        resolve_pending(ctx, calls, f"Action blocked. User feedback: {feedback}")
+                        run_turn("feedback", ctx, tool_calls=calls, reason=f"Action blocked. User feedback: {feedback}")
                     st.rerun()
         st.stop()
 
@@ -604,10 +650,8 @@ if user_text:
     with st.chat_message("assistant", avatar=":material/fitness_center:"):
         with st.spinner("Thinking..."):
             try:
-                run_async(agent.ainvoke({"messages": [{"role": "user", "content": content}]}, config, context=ctx))
-                advance(ctx)
+                run_turn("message", ctx, payload=content)
                 st.session_state.uploader_key += 1  # clear the attachment after it's sent
                 st.rerun()
             except Exception as e:
-                flush_traces()
                 st.error(f"Something went wrong: {e}. Try sending your message again.")
